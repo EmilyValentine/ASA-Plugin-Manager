@@ -131,6 +131,25 @@ def find_plugin_root(extract_dir, plugin_name):
 
     return None
 
+def find_plugin_root_strict(extract_dir, plugin_name):
+    """Like find_plugin_root but only accepts a real match against the
+    given plugin_name (an identically named folder, or a matching
+    <plugin_name>.dll). Used when testing a zip against a list of
+    already-known plugin names, where the generic single-folder /
+    any-dll fallbacks in find_plugin_root would wrongly claim a match
+    for the first name tried regardless of the zip's actual contents."""
+    name_lower = plugin_name.lower()
+    target_dll = name_lower + ".dll"
+    for root, dirs, files in os.walk(extract_dir):
+        for d in dirs:
+            if d.lower() == name_lower:
+                return os.path.join(root, d)
+    for root, dirs, files in os.walk(extract_dir):
+        for f in files:
+            if f.lower() == target_dll:
+                return root
+    return None
+
 def guess_plugin_name_from_zip(zip_filename):
     """Derive a likely plugin name from a zip's filename by stripping a
     trailing version-like suffix, e.g. 'ArkShopUI1.8A.zip' -> 'ArkShopUI'."""
@@ -158,15 +177,20 @@ def extract_zip_into_plugins_folder(zip_path, plugins_folder):
             return None, (f"{os.path.basename(zip_path)}: this zip contains unsafe file paths "
                           f"and was not extracted. Skipped for safety.")
 
-        # Prefer matching a plugin name we already have a folder for
+        # Prefer matching a plugin name we already have a folder for.
+        # Strict matching only here: the generic fallbacks in
+        # find_plugin_root would otherwise wrongly claim a match for
+        # whichever existing name happens to be checked first.
         target_name, target_root = None, None
         for name in existing_names:
-            root = find_plugin_root(tmp, name)
+            root = find_plugin_root_strict(tmp, name)
             if root:
                 target_name, target_root = name, root
                 break
 
-        # Otherwise guess a name from the zip's own filename
+        # Otherwise guess a name from the zip's own filename. Full
+        # fallback logic is fine here since there is no existing
+        # folder to mismatch against.
         if not target_root:
             guess = guess_plugin_name_from_zip(zip_path)
             root = find_plugin_root(tmp, guess)
@@ -1269,3 +1293,4 @@ if __name__ == "__main__":
             pass
     app = ASAPluginUpdater()
     app.mainloop()
+    
