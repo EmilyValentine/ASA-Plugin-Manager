@@ -151,6 +151,29 @@ def read_plugin_version(plugin_path):
             return str(data[key])
     return None
 
+def parse_version(v):
+    """Extract numeric components from a version string for comparison,
+    e.g. '1.39' -> (1, 39). Returns None if nothing numeric is found."""
+    if v is None:
+        return None
+    parts = re.findall(r"\d+", str(v))
+    if not parts:
+        return None
+    return tuple(int(p) for p in parts)
+
+def is_newer_version(candidate_version, installed_version):
+    """True if candidate_version is a strictly higher version than
+    installed_version, comparing numeric components rather than treating
+    them as decimals (so '1.39' correctly beats '1.4')."""
+    a = parse_version(candidate_version)
+    b = parse_version(installed_version)
+    if a is None or b is None:
+        return False
+    length = max(len(a), len(b))
+    a = a + (0,) * (length - len(a))
+    b = b + (0,) * (length - len(b))
+    return a > b
+
 def get_last_updated_text(folder_path):
     """Newest file modified time under folder_path, formatted for display."""
     try:
@@ -608,6 +631,7 @@ class MapRow:
             tk.Label(self._installed_container, text="No plugins found in this folder.",
                      bg=NEU_BASE, fg=TEXT3, font=("Segoe UI", 8)).pack(anchor="w")
             return
+        plugins_folder = self.app.plugins_var.get().strip()
         for d in subdirs:
             row = tk.Frame(self._installed_container, bg=NEU_BASE)
             row.pack(fill="x", pady=1)
@@ -617,6 +641,16 @@ class MapRow:
             if version:
                 tk.Label(row, text=f"v{version}", bg=NEU_BASE, fg=TEXT2,
                          font=("Segoe UI", 8)).pack(side="left", padx=(6, 0))
+
+            # compare against the version sitting in the PLUGINS drop folder
+            if plugins_folder:
+                source_path = os.path.join(plugins_folder, d.name)
+                if os.path.isdir(source_path):
+                    source_version = read_plugin_version(source_path)
+                    if is_newer_version(source_version, version):
+                        tk.Label(row, text="Newer version available", bg=NEU_BASE,
+                                 fg=WARN, font=("Segoe UI", 8, "bold")).pack(side="left", padx=(8, 0))
+
             tk.Label(row, text=get_last_updated_text(d.path), bg=NEU_BASE, fg=TEXT3,
                      font=("Segoe UI", 8)).pack(side="right")
 
