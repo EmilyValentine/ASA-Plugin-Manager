@@ -241,7 +241,10 @@ def find_plugins_folders(root, max_results=500):
 def read_plugin_version(plugin_path):
     """Look for PluginInfo.json in the plugin folder and pull out a
     version string. Different authors use different key names, so try
-    the common ones in order."""
+    the common ones in order. Some authors also ship a separate 'Tag'
+    field for hotfix letters (e.g. Version 1.8 + Tag 'A' meaning '1.8A')
+    rather than folding it into the version string itself, so that is
+    combined in here too when present."""
     info_path = os.path.join(plugin_path, "PluginInfo.json")
     if not os.path.isfile(info_path):
         return None
@@ -252,10 +255,23 @@ def read_plugin_version(plugin_path):
         return None
     if not isinstance(data, dict):
         return None
+
+    version = None
     for key in ("Version", "PluginVersion", "version", "pluginVersion", "VERSION"):
         if key in data and data[key] not in (None, ""):
-            return str(data[key])
-    return None
+            version = str(data[key])
+            break
+    if version is None:
+        return None
+
+    for key in ("Tag", "VersionTag", "tag"):
+        if key in data and data[key] not in (None, ""):
+            tag = str(data[key]).strip()
+            if tag:
+                version = f"{version}{tag}"
+            break
+
+    return version
 
 def parse_version(v):
     """Parse a version string into (numeric_tuple, letter_suffix) so that
