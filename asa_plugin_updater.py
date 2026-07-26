@@ -971,9 +971,18 @@ class ASAPluginUpdater(tk.Tk):
         tk.Label(scan, text="Pick the folder where your servers are installed. Searches for any\n"
                  "...ShooterGame\\Binaries\\Win64\\ArkApi\\Plugins folder inside it, however deep.",
                  bg=GLASS, fg=TEXT2, font=("Segoe UI", 8), justify="left").pack(anchor="w", padx=8, pady=(0, 6))
-        _, scan_btn = pill_button(scan, "Browse and scan for maps", ACCENT_DIM, TEXT,
-                                  self._scan_for_maps, font=("Segoe UI", 8), padx=10, pady=4)
-        scan_btn.master.pack(anchor="w", padx=8, pady=(0, 8))
+        scan_btn_row = tk.Frame(scan, bg=GLASS)
+        scan_btn_row.pack(anchor="w", padx=8, pady=(0, 8))
+        self._scan_btn_shell, self._scan_btn = pill_button(
+            scan_btn_row, "Browse and scan for maps", ACCENT_DIM, TEXT,
+            self._scan_for_maps, font=("Segoe UI", 8), padx=10, pady=4)
+        self._scan_btn_shell.pack(side="left")
+        self._scan_spinner_lbl = tk.Label(scan_btn_row, text="", bg=GLASS, fg=WARN,
+                                          font=("Segoe UI", 9, "bold"))
+        self._scan_spinner_lbl.pack(side="left", padx=(10, 0))
+        self._scanning = False
+        self._scan_spinner_frames = ["|", "/", "-", "\\"]
+        self._scan_spinner_i = 0
 
         _, add_btn = pill_button(c3, "+ Add map manually", GLASS_EDGE, TEXT2,
                                  lambda: self._add_map_row(),
@@ -1081,27 +1090,53 @@ class ASAPluginUpdater(tk.Tk):
             messagebox.showwarning(APP_NAME, f"Path not found:\n{pattern}")
 
     def _scan_for_maps(self):
+        if self._scanning:
+            return  # already running, ignore extra clicks
         root = filedialog.askdirectory(
             title="Select the folder where your servers are installed")
         if not root:
             return
-        self._log(f"Scanning {root} for Plugins folders...", "dim")
+        self._log(f"Scanning {root} for Plugins folders. This can take a while on a large drive...", "dim")
+        self._scanning = True
+        self._scan_btn.config(state="disabled")
+        self.config(cursor="watch")
+        self._animate_scan_spinner()
         threading.Thread(target=self._scan_worker, args=(root,), daemon=True).start()
+
+    def _animate_scan_spinner(self):
+        if not self._scanning:
+            self._scan_spinner_lbl.config(text="")
+            return
+        frame = self._scan_spinner_frames[self._scan_spinner_i % len(self._scan_spinner_frames)]
+        self._scan_spinner_lbl.config(text=f"{frame} scanning...")
+        self._scan_spinner_i += 1
+        self.after(150, self._animate_scan_spinner)
 
     def _scan_worker(self, root):
         try:
             matches = find_plugins_folders(root)
         except OSError as e:
-            self._log(f"Scan failed: {e}", "err")
+            self.after(0, self._scan_failed, str(e))
             return
         self.after(0, self._scan_done, matches)
 
+    def _scan_failed(self, error_text):
+        self._scanning = False
+        self._scan_btn.config(state="normal")
+        self.config(cursor="")
+        self._log(f"Scan failed: {error_text}", "err")
+        messagebox.showerror(APP_NAME, f"Scan failed:\n{error_text}")
+
     def _scan_done(self, matches):
+        self._scanning = False
+        self._scan_btn.config(state="normal")
+        self.config(cursor="")
         if not matches:
+            self._log("Scan finished: no ArkApi\\Plugins folders were found in that location.", "warn")
             messagebox.showinfo(APP_NAME,
                 "No ArkApi\\Plugins folders were found in that location.\n"
-                "Make sure you picked a folder that contains your server install(s).")
-            self._log("Scan finished: no Plugins folders found.", "warn")
+                "Make sure you picked a folder that actually contains your server install(s), "
+                "for example the drive or folder above where ShooterGame lives.")
             return
         existing_paths = {os.path.normpath(r.path_var.get()) for r in self._map_rows}
         added = 0
@@ -1293,4 +1328,3 @@ if __name__ == "__main__":
             pass
     app = ASAPluginUpdater()
     app.mainloop()
-    
