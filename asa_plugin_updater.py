@@ -19,6 +19,20 @@ PRESERVE_FILES = {"config.json"}
 PRESERVE_PATTERNS = ("*.db", "*.sqlite", "*.sqlite3", "*.dat")
 GITHUB_API = "https://api.github.com/repos/{owner}/{repo}/releases/latest"
 
+def is_file_locked(path):
+    """Return True if an existing file cannot currently be opened for
+    writing, which on Windows is how a dll or other file held open by a
+    running process shows up. A file that does not exist yet is never
+    considered locked, since there is nothing to lock."""
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "r+b"):
+            pass
+        return False
+    except (PermissionError, OSError):
+        return True
+
 def matches_preserve(name):
     import fnmatch
     if name in PRESERVE_FILES:
@@ -1294,13 +1308,39 @@ class ASAPluginUpdater(tk.Tk):
                     skipped += 1
                     continue
                 self._log(f"\n  > {label}", "ok")
-                map_had_error = False
+
+                # Phase 1: work out what each file needs (copy, keep, or
+                # locked), without writing anything yet. If any file the
+                # map is running is holding open, the WHOLE map is
+                # skipped untouched below, so a locked dll can never end
+                # up out of sync with an already-updated PluginInfo.json
+                # or any other file.
+                to_copy, to_keep, locked_files = [], [], []
                 for src_path in source_files:
                     rel = os.path.relpath(src_path, pe.path)
                     out = os.path.join(dest, rel)
                     if matches_preserve(os.path.basename(rel)) and os.path.exists(out):
-                        self._log(f"    keep  {rel}", "keep")
+                        to_keep.append(rel)
                         continue
+                    if (not dry) and is_file_locked(out):
+                        locked_files.append(rel)
+                    else:
+                        to_copy.append((src_path, rel, out))
+
+                if locked_files:
+                    for rel in locked_files:
+                        self._log(f"    LOCKED  {rel}", "err")
+                    self._log(f"    {label}: SKIPPED, nothing changed here "
+                              f"(stop the map and run again)", "warn")
+                    locked_any = True
+                    skipped += 1
+                    continue
+
+                for rel in to_keep:
+                    self._log(f"    keep  {rel}", "keep")
+
+                map_had_error = False
+                for src_path, rel, out in to_copy:
                     self._log(f"    copy  {rel}", "copy")
                     if not dry:
                         os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -1309,7 +1349,11 @@ class ASAPluginUpdater(tk.Tk):
                             now = datetime.now().timestamp()
                             os.utime(out, (now, now))
                         except PermissionError:
-                            self._log(f"    LOCKED  {rel}  (stop the map and run again)", "err")
+                            # Rare: the file became locked between our
+                            # check above and this copy (for example the
+                            # map was started at that exact moment).
+                            self._log(f"    LOCKED  {rel}  (became locked mid-update, "
+                                      f"stop the map and run again)", "err")
                             locked_any = True
                             map_had_error = True
                 if not map_had_error:
