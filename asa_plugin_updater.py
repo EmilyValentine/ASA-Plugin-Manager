@@ -79,6 +79,26 @@ def http_download(url, dest_path, progress_cb=None):
             if progress_cb and total:
                 progress_cb(done, total)
 
+class UnsafeZipError(Exception):
+    """Raised when a zip contains an entry that would extract outside
+    the intended destination folder (a "zip slip" path traversal)."""
+    pass
+
+def safe_extract_zip(zip_path, extract_dir):
+    """Extract a zip file, rejecting any entry whose resolved path would
+    land outside extract_dir. Raises zipfile.BadZipFile for a corrupt
+    zip, or UnsafeZipError if a path-traversal entry is found. Nothing
+    is extracted if any entry is unsafe; the check runs before writing
+    any files."""
+    os.makedirs(extract_dir, exist_ok=True)
+    base = os.path.normpath(extract_dir)
+    with zipfile.ZipFile(zip_path) as z:
+        for member in z.namelist():
+            resolved = os.path.normpath(os.path.join(base, member))
+            if resolved != base and not resolved.startswith(base + os.sep):
+                raise UnsafeZipError(member)
+        z.extractall(extract_dir)
+
 def find_plugin_root(extract_dir, plugin_name):
     """Locate the folder inside an extracted zip that is the actual plugin.
     Handles zips where the correctly named folder is nested inside a
@@ -110,6 +130,68 @@ def find_plugin_root(extract_dir, plugin_name):
         return extract_dir
 
     return None
+
+def guess_plugin_name_from_zip(zip_filename):
+    """Derive a likely plugin name from a zip's filename by stripping a
+    trailing version-like suffix, e.g. 'ArkShopUI1.8A.zip' -> 'ArkShopUI'."""
+    base = os.path.splitext(os.path.basename(zip_filename))[0]
+    stripped = re.sub(r"[-_ ]*v?[0-9]+(?:[.\-][0-9]+)*\s*[a-zA-Z]?$", "", base).strip()
+    return stripped or base
+
+def extract_zip_into_plugins_folder(zip_path, plugins_folder):
+    """Extract a zip sitting directly in the PLUGINS folder into its own
+    correctly named subfolder, matching it against plugins already
+    tracked where possible so the destination folder name and casing
+    stays consistent with what is deployed to the maps. Handles zips
+    whose internal folder name does not match the zip's own filename.
+    Deletes the zip after a successful extraction.
+    Returns (plugin_name, message) on success, or (None, message) on
+    failure; nothing is deleted on failure."""
+    existing_names = [d.name for d in os.scandir(plugins_folder) if d.is_dir()]
+    tmp = tempfile.mkdtemp(prefix="asa_zip_")
+    try:
+        try:
+            safe_extract_zip(zip_path, tmp)
+        except zipfile.BadZipFile:
+            return None, f"{os.path.basename(zip_path)}: not a valid zip file."
+        except UnsafeZipError:
+            return None, (f"{os.path.basename(zip_path)}: this zip contains unsafe file paths "
+                          f"and was not extracted. Skipped for safety.")
+
+        # Prefer matching a plugin name we already have a folder for
+        target_name, target_root = None, None
+        for name in existing_names:
+            root = find_plugin_root(tmp, name)
+            if root:
+                target_name, target_root = name, root
+                break
+
+        # Otherwise guess a name from the zip's own filename
+        if not target_root:
+            guess = guess_plugin_name_from_zip(zip_path)
+            root = find_plugin_root(tmp, guess)
+            if root:
+                target_name, target_root = guess, root
+
+        if not target_root:
+            return None, (f"{os.path.basename(zip_path)}: could not find a plugin folder "
+                          f"inside this zip. Extract it manually and rename the folder "
+                          f"to match the plugin name.")
+
+        dest = os.path.join(plugins_folder, target_name)
+        os.makedirs(dest, exist_ok=True)
+        for root_dir, _, files in os.walk(target_root):
+            for f in files:
+                src_file = os.path.join(root_dir, f)
+                rel = os.path.relpath(src_file, target_root)
+                out = os.path.join(dest, rel)
+                os.makedirs(os.path.dirname(out), exist_ok=True)
+                shutil.copy2(src_file, out)
+
+        os.remove(zip_path)
+        return target_name, f"Extracted {os.path.basename(zip_path)} into {target_name}."
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 TARGET_SUFFIX_PARTS = ["shootergame", "binaries", "win64", "arkapi", "plugins"]
 SKIP_SCAN_DIR_NAMES = {"content", "saved", "mods", ".git", "steamapps", "redist", "logs"}
@@ -152,27 +234,42 @@ def read_plugin_version(plugin_path):
     return None
 
 def parse_version(v):
-    """Extract numeric components from a version string for comparison,
-    e.g. '1.39' -> (1, 39). Returns None if nothing numeric is found."""
+    """Parse a version string into (numeric_tuple, letter_suffix) so that
+    '1.39' -> ((1, 39), '') and '1.8a' -> ((1, 8), 'a'). Handles an
+    optional leading 'v' and optional space before a trailing letter
+    suffix (e.g. '1.8 A'). Falls back to any digit groups found if the
+    string does not match the expected shape. Returns None if nothing
+    numeric is found at all."""
     if v is None:
         return None
-    parts = re.findall(r"\d+", str(v))
+    s = str(v).strip()
+    m = re.match(r"^\s*v?([0-9]+(?:\.[0-9]+)*)\s*([a-zA-Z]*)\s*$", s)
+    if m:
+        nums = tuple(int(p) for p in m.group(1).split("."))
+        suffix = m.group(2).lower()
+        return (nums, suffix)
+    parts = re.findall(r"\d+", s)
     if not parts:
         return None
-    return tuple(int(p) for p in parts)
+    return (tuple(int(p) for p in parts), "")
 
 def is_newer_version(candidate_version, installed_version):
     """True if candidate_version is a strictly higher version than
-    installed_version, comparing numeric components rather than treating
-    them as decimals (so '1.39' correctly beats '1.4')."""
+    installed_version. Numeric components are compared as integers
+    rather than decimals (so '1.39' correctly beats '1.4'), and a
+    letter suffix such as '1.8a' is treated as newer than the plain
+    '1.8' it patches, with suffixes compared alphabetically."""
     a = parse_version(candidate_version)
     b = parse_version(installed_version)
     if a is None or b is None:
         return False
-    length = max(len(a), len(b))
-    a = a + (0,) * (length - len(a))
-    b = b + (0,) * (length - len(b))
-    return a > b
+    (a_nums, a_suffix), (b_nums, b_suffix) = a, b
+    length = max(len(a_nums), len(b_nums))
+    a_nums = a_nums + (0,) * (length - len(a_nums))
+    b_nums = b_nums + (0,) * (length - len(b_nums))
+    if a_nums != b_nums:
+        return a_nums > b_nums
+    return a_suffix > b_suffix
 
 def get_last_updated_text(folder_path):
     """Newest file modified time under folder_path, formatted for display."""
@@ -500,10 +597,14 @@ class PluginRow:
 
             extract_dir = os.path.join(tmp, "x")
             try:
-                with zipfile.ZipFile(zip_path) as z:
-                    z.extractall(extract_dir)
+                safe_extract_zip(zip_path, extract_dir)
             except zipfile.BadZipFile:
                 self._set_status("bad zip file", DANGER)
+                return
+            except UnsafeZipError:
+                self._set_status("unsafe zip contents, not extracted", DANGER)
+                self.app._log(f"{self.name}: the downloaded zip contained unsafe file paths "
+                              f"and was not extracted.", "err")
                 return
 
             src = find_plugin_root(extract_dir, self.name)
@@ -804,8 +905,9 @@ class ASAPluginUpdater(tk.Tk):
                                      self.refresh_plugins,
                                      font=("Segoe UI", 8), padx=8, pady=3)
         refresh_btn.master.pack(side="right", padx=(0, 12))
-        tk.Label(c2, text="Plugins found in your PLUGINS folder. Click + on a plugin to add\n"
-                 "a GitHub source, website, or Discord link, plus your own notes.",
+        tk.Label(c2, text="Plugins found in your PLUGINS folder. Any zip dropped in here is\n"
+                 "extracted automatically on Refresh. Click + on a plugin to add a GitHub\n"
+                 "source, website, or Discord link, plus your own notes.",
                  bg=GLASS, fg=TEXT2, font=("Segoe UI", 8),
                  justify="left").pack(anchor="w", padx=12, pady=(0, 8))
         self._plugins_container = tk.Frame(c2, bg=GLASS)
@@ -885,6 +987,13 @@ class ASAPluginUpdater(tk.Tk):
                      text="Set your PLUGINS folder above, then click Refresh.",
                      bg=GLASS, fg=TEXT3, font=("Segoe UI", 8)).pack(anchor="w")
             return
+
+        # auto-extract any zip files dropped directly into the PLUGINS folder
+        zips = [f for f in os.scandir(folder) if f.is_file() and f.name.lower().endswith(".zip")]
+        for zf in zips:
+            name, msg = extract_zip_into_plugins_folder(zf.path, folder)
+            self._log(msg, "ok" if name else "warn")
+
         # clear any placeholder labels
         for w in self._plugins_container.winfo_children():
             if isinstance(w, tk.Label):
